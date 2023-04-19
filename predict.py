@@ -8,17 +8,18 @@ import cv2
 import torch
 from PIL import Image
 import mmcv
-from mmdet.core.visualization.image import imshow_det_bboxes
+import mmengine
+# from mmcv.visualization.image import imshow_det_bboxes
 import numpy as np
 import pycocotools.mask as maskUtils
+from tqdm.auto import tqdm
 
 from transformers import CLIPProcessor, CLIPModel
-from transformers import AutoProcessor, CLIPSegForImageSegmentation
+from transformers import AutoProcessor, AutoModelForZeroShotImageClassification, CLIPSegForImageSegmentation
 from transformers import OneFormerProcessor, OneFormerForUniversalSegmentation
 from transformers import BlipProcessor, BlipForConditionalGeneration
 from cog import BasePredictor, Input, Path, BaseModel
 
-sys.path.append("..")
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
 
 sys.path.insert(0, "scripts")
@@ -29,6 +30,7 @@ from clipseg import clipseg_segmentation
 from oneformer import oneformer_coco_segmentation, oneformer_ade20k_segmentation
 from blip import open_vocabulary_classification_blip
 
+from show_obj_masks import imshow_det_bboxes
 
 MODEL_CACHE = "model_cache"
 
@@ -43,66 +45,67 @@ class Predictor(BasePredictor):
         """Load the model into memory to make running multiple predictions efficient"""
         sam_checkpoint = "sam_vit_h_4b8939.pth"
         model_type = "default"
-        self.sam = sam_model_registry[model_type](checkpoint=sam_checkpoint).to("cuda")
+        self.rank = "cuda"
+        local_files_only = True
+        self.sam = sam_model_registry[model_type](checkpoint=sam_checkpoint).to(self.rank)
         self.generator = SamAutomaticMaskGenerator(self.sam, output_mode="coco_rle")
 
         # semantic segmentation
-        rank = 0
         # the following models are pre-downloaded and cached to MODEL_CACHE to speed up inference 
         self.clip_processor = CLIPProcessor.from_pretrained(
             "openai/clip-vit-large-patch14",
             cache_dir=MODEL_CACHE,
-            local_files_only=True,
+            local_files_only=local_files_only,
         )
         self.clip_model = CLIPModel.from_pretrained(
             "openai/clip-vit-large-patch14",
             cache_dir=MODEL_CACHE,
-            local_files_only=True,
-        ).to(rank)
+            local_files_only=local_files_only,
+        ).to(self.rank)
 
         self.oneformer_ade20k_processor = OneFormerProcessor.from_pretrained(
             "shi-labs/oneformer_ade20k_swin_large",
             cache_dir=MODEL_CACHE,
-            local_files_only=True,
+            local_files_only=local_files_only,
         )
         self.oneformer_ade20k_model = OneFormerForUniversalSegmentation.from_pretrained(
             "shi-labs/oneformer_ade20k_swin_large",
             cache_dir=MODEL_CACHE,
-            local_files_only=True,
-        ).to(rank)
+            local_files_only=local_files_only,
+        ).to("cpu")
 
         self.oneformer_coco_processor = OneFormerProcessor.from_pretrained(
             "shi-labs/oneformer_coco_swin_large",
             cache_dir=MODEL_CACHE,
-            local_files_only=True,
+            local_files_only=local_files_only,
         )
         self.oneformer_coco_model = OneFormerForUniversalSegmentation.from_pretrained(
             "shi-labs/oneformer_coco_swin_large",
             cache_dir=MODEL_CACHE,
-            local_files_only=True,
-        ).to(rank)
+            local_files_only=local_files_only,
+        ).to("cpu")
 
         self.blip_processor = BlipProcessor.from_pretrained(
             "Salesforce/blip-image-captioning-large",
             cache_dir=MODEL_CACHE,
-            local_files_only=True,
+            local_files_only=local_files_only,
         )
         self.blip_model = BlipForConditionalGeneration.from_pretrained(
             "Salesforce/blip-image-captioning-large",
             cache_dir=MODEL_CACHE,
-            local_files_only=True,
-        ).to(rank)
+            local_files_only=local_files_only,
+        ).to(self.rank)
 
         self.clipseg_processor = AutoProcessor.from_pretrained(
             "CIDAS/clipseg-rd64-refined",
             cache_dir=MODEL_CACHE,
-            local_files_only=True,
+            local_files_only=local_files_only,
         )
         self.clipseg_model = CLIPSegForImageSegmentation.from_pretrained(
             "CIDAS/clipseg-rd64-refined",
             cache_dir=MODEL_CACHE,
-            local_files_only=True,
-        ).to(rank)
+            local_files_only=local_files_only,
+        ).to(self.rank)
         self.clipseg_processor.image_processor.do_resize = False
 
     def predict(
@@ -115,6 +118,8 @@ class Predictor(BasePredictor):
         img = cv2.imread(str(image))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         masks = self.generator.generate(img)
+        masks = sorted(masks, key=lambda x: x["predicted_iou"], reverse=True)
+        masks = masks[:60] # top 60 masks
 
         seg_json = "/tmp/mask.json"
         with open(seg_json, "w") as f:
@@ -128,6 +133,7 @@ class Predictor(BasePredictor):
             str(image),
             json_out,
             seg_out,
+            self.rank,
             clip_processor=self.clip_processor,
             clip_model=self.clip_model,
             oneformer_ade20k_processor=self.oneformer_ade20k_processor,
@@ -150,7 +156,7 @@ def semantic_annotation_pipeline(
     image,
     json_out,
     seg_out,
-    rank=0,
+    rank="cpu",
     scale_small=1.2,
     scale_large=1.6,
     clip_processor=None,
@@ -164,17 +170,17 @@ def semantic_annotation_pipeline(
     clipseg_processor=None,
     clipseg_model=None,
 ):
-    anns = mmcv.load(seg_json)
+    anns = mmengine.fileio.load(seg_json)
     img = mmcv.imread(image)
     bitmasks, class_names = [], []
     class_ids_from_oneformer_coco = oneformer_coco_segmentation(
-        Image.fromarray(img), oneformer_coco_processor, oneformer_coco_model, 0
+        Image.fromarray(img), oneformer_coco_processor, oneformer_coco_model, "cpu"
     )
     class_ids_from_oneformer_ade20k = oneformer_ade20k_segmentation(
-        Image.fromarray(img), oneformer_ade20k_processor, oneformer_ade20k_model, 0
+        Image.fromarray(img), oneformer_ade20k_processor, oneformer_ade20k_model, "cpu"
     )
 
-    for ann in anns:
+    for ann in tqdm(anns):
         valid_mask = torch.tensor(maskUtils.decode(ann["segmentation"])).bool()
         # get the class ids of the valid pixels
         coco_propose_classes_ids = class_ids_from_oneformer_coco[valid_mask]
@@ -285,7 +291,8 @@ def semantic_annotation_pipeline(
         class_names.append(ann["class_name"])
         bitmasks.append(maskUtils.decode(ann["segmentation"]))
 
-    mmcv.dump(anns, json_out)
+    # print(bitmasks)
+    mmengine.fileio.dump(anns, json_out)
     imshow_det_bboxes(
         img,
         bboxes=None,

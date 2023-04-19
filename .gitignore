@@ -1,3 +1,12 @@
+model_cache
+etc/
+share/
+*pth
+*scratch*
+*temp*
+*tmp*
+pyvenv.cfg
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -14,6 +23,7 @@ dist/
 downloads/
 eggs/
 .eggs/
+bin/
 lib/
 lib64/
 parts/
